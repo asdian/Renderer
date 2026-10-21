@@ -9,6 +9,9 @@
 #include "MurmurHash2.h"
 #include <sstream>
 #include <algorithm>
+#include <unordered_set>
+#include <unordered_map>
+#include <tuple>
 
 static GLuint g_hStudioUBO{};
 
@@ -55,7 +58,7 @@ int*         r_smodels_total                   = NULL;
 int*         r_amodels_drawn                   = NULL;
 int*         r_topcolor                        = NULL;
 int*         r_bottomcolor                     = NULL;
-
+IMetaRendererStudioEnvProvider* g_pStudioEnvProvider = nullptr;
 
 
 //Cvars
@@ -101,6 +104,9 @@ cvar_t* r_studio_legacy_elight = NULL;
 cvar_t* r_studio_bone_caches = NULL;
 
 cvar_t* r_studio_celshade_debug = NULL;
+cvar_t* r_csoenv_debug          = NULL; // 0 = off, 1 = solid magenta, 2 = show reflection vector as color
+//r_csoenv_mulbright / r_csoenv_addbright / r_csoenv_index are registered by the
+//IMetaRendererStudioEnv provider (MH_Beamgun), not here.
 
 cvar_t* r_lowerbody_model_scale       = NULL;
 cvar_t* r_lowerbody_model_offset      = NULL;
@@ -245,7 +251,40 @@ studiohdr_t* R_GetStudioTextureHeader(studiohdr_t* studiohdr, model_t* texturemo
 
 studiohdr_t* R_GetStudioTextureHeader(studiohdr_t* studiohdr, CStudioModelRenderData* pRenderData)
 {
-    return R_GetStudioTextureHeader(studiohdr, pRenderData->TextureModel);
+    auto ptexturehdr = R_GetStudioTextureHeader(studiohdr, pRenderData->TextureModel);
+
+    // Naming convention: any texture named starting with "$20" renders
+    // fullbright regardless of whatever flags studiomdl.exe baked in at
+    // compile time. Patched here rather than in R_StudioCreateMaterial:
+    // materials are only ever created lazily for textures that get an
+    // explicit diffuse/normal/specular override (map-entity keyvalue or
+    // SetStudioTextureOverride) - a texture nobody ever overrides has its
+    // flags read straight from ptexture[] every frame (see
+    // R_StudioSetupSkin's "StudioProgramState = ptexture[uskinref].flags")
+    // without ever touching the material system, so patching there would
+    // silently miss exactly the textures this doesn't override. This
+    // function, on the other hand, runs on every normal render for every
+    // studio model via R_StudioGetTextureHeaderSkinref, so it's guaranteed
+    // to see every texture table at least once.
+    //
+    // Guarded by s_PatchedTextureHeaders so the scan only ever runs once
+    // per unique texture header (shared across every model/skin that
+    // points at the same table, e.g. via an external T.mdl), not once per
+    // frame per model.
+    static std::unordered_set<studiohdr_t*> s_PatchedTextureHeaders;
+    if (ptexturehdr && ptexturehdr->textureindex && s_PatchedTextureHeaders.insert(ptexturehdr).second)
+    {
+        auto ptexture = (mstudiotexture_t*)((byte*)ptexturehdr + ptexturehdr->textureindex);
+        for (int i = 0; i < ptexturehdr->numtextures; ++i)
+        {
+            if (!strnicmp(ptexture[i].name, "$20", 3))
+                ptexture[i].flags |= STUDIO_NF_FULLBRIGHT;
+            if (!strnicmp(ptexture[i].name, "$0b", 3))
+                ptexture[i].flags |= STUDIO_NF_FULLBRIGHT | STUDIO_NF_ADDITIVE;
+        }
+    }
+
+    return ptexturehdr;
 }
 
 void R_StudioGetTextureHeaderSkinref(
@@ -323,6 +362,96 @@ std::shared_ptr<CStudioModelRenderMaterial> R_StudioCreateMaterial(CStudioModelR
     pStudioMaterial->base_specular.Init(r_studio_base_specular, 2, ConVar_None);
 
     return pStudioMaterial;
+}
+
+/*
+    Purpose: Runtime, per-(model, texIndex) counterpart to the map-entity
+    "replacetexture" keyvalue (see R_StudioLoadExternalFile_TextureLoad /
+    R_StudioSetupMaterial above). That path only ever sets ONE diffuse
+    override per material, driven once from a bspentity's keyvalues at load
+    time. This one lets a MetaHookSv client plugin (via
+    IMetaRenderer::SetStudioTextureOverride) swap the override for a specific
+    texture slot at any time, e.g. per-frame from a view-model animation
+    callback - which is what makes it possible to drive several DIFFERENT
+    override textures on the SAME model (one per texIndex) instead of being
+    limited to the single slot the entity-keyvalue path fights over.
+
+    "texIndex" is the RAW index into the model's own texture table (the same
+    order a model viewer's texture list shows) - i.e. an index into
+    ptexture[] below - NOT a skin index (mstudiotexture_t entries are shared
+    across skin families via pskinref[], texIndex bypasses that and points
+    at one specific mstudiotexture_t).
+
+    numframes/framerate: if numframes > 1, gltexturenum MUST be a
+    GL_TEXTURE_2D_ARRAY with that many layers - Renderer then animates
+    through them on its own each frame at "framerate", same as an animated
+    replacetexture (see STUDIO_ANIMATED_TEXTURE_ENABLED above). Pass
+    numframes = 0 (or 1) for a plain single GL_TEXTURE_2D.
+
+    scaleX/scaleY: UV tiling scale for this slot; pass 1.0f/1.0f to leave the
+    model's own scale untouched (R_StudioSetupMaterial only applies a
+    nonzero override).
+
+    Pass gltexturenum = 0 to clear a previously-set override for this exact
+    (mod, texIndex) pair and revert that slot back to the model's own baked
+    texture.
+
+    Returns false if mod is null, has no texture table (mstudiotexture list),
+    or texIndex is out of range for that table - true otherwise.
+*/
+bool R_StudioSetTextureOverride(model_t* mod, int texIndex, int gltexturenum, int numframes, float framerate, float scaleX, float scaleY)
+{
+    if (!mod)
+        return false;
+
+    auto studiohdr = (studiohdr_t*)IEngineStudio.Mod_Extradata(mod);
+    if (!studiohdr)
+        return false;
+
+    auto pRenderData = R_GetStudioRenderDataFromModel(mod);
+    if (!pRenderData)
+        return false;
+
+    // Same "external T.mdl" indirection R_StudioGetTextureHeaderSkinref uses -
+    // the real texture table can live in a separate model when the .mdl
+    // ships with an external "modelnameT.mdl".
+    auto ptexturehdr = R_GetStudioTextureHeader(studiohdr, pRenderData.get());
+    if (!ptexturehdr || !ptexturehdr->textureindex)
+        return false;
+#if 0
+	// TEMP DIAGNOSTIC - dumps this model's real texture table exactly once
+	// so a caller's texIndex assumptions can be checked against it. Remove
+	// once texIndex numbering is confirmed correct.
+	static const model_t* s_LastDumpedModel = nullptr;
+	if (mod != s_LastDumpedModel)
+	{
+		s_LastDumpedModel = mod;
+		//gEngfuncs.Con_Printf("R_StudioSetTextureOverride: \"%s\" has %d textures:\n", studiohdr->name, ptexturehdr->numtextures);
+		auto ptextureDump = (mstudiotexture_t*)((byte*)ptexturehdr + ptexturehdr->textureindex);
+		for (int i = 0; i < ptexturehdr->numtextures; ++i)
+			gEngfuncs.Con_Printf("  [%d] %s\n", i, ptextureDump[i].name);
+	}
+#endif
+    if (texIndex < 0 || texIndex >= ptexturehdr->numtextures)
+    {
+        gEngfuncs.Con_Printf("R_StudioSetTextureOverride: texIndex %d out of range for \"%s\" (numtextures=%d)\n", texIndex, studiohdr->name, ptexturehdr->numtextures);
+        return false;
+    }
+
+    auto ptexture = (mstudiotexture_t*)((byte*)ptexturehdr + ptexturehdr->textureindex) + texIndex;
+
+    auto pStudioMaterial = R_StudioCreateMaterial(pRenderData.get(), ptexture);
+    if (!pStudioMaterial)
+        return false;
+
+    auto& overrideTex        = pStudioMaterial->textures[STUDIO_DIFFUSE_TEXTURE];
+    overrideTex.gltexturenum = gltexturenum;
+    overrideTex.numframes    = numframes;
+    overrideTex.framerate    = framerate;
+    overrideTex.scaleX       = scaleX;
+    overrideTex.scaleY       = scaleY;
+
+    return true;
 }
 
 using CVector3List = std::vector<vertex3f_t>;
@@ -1231,6 +1360,9 @@ void R_UseStudioProgram(program_state_t state, studio_program_t* progOutput)
         if (state & STUDIO_NF_CHROME)
             defs << "#define STUDIO_NF_CHROME\n";
 
+        if (state & STUDIO_NF_CSO_ENV)
+            defs << "#define CSO_ENV\n";
+
         if (state & STUDIO_NF_FULLBRIGHT)
             defs << "#define STUDIO_NF_FULLBRIGHT\n";
 
@@ -1419,6 +1551,8 @@ void R_UseStudioProgram(program_state_t state, studio_program_t* progOutput)
             SHADER_UNIFORM(prog, r_packed_index, "r_packed_index");
             SHADER_UNIFORM(prog, r_framerate_numframes, "r_framerate_numframes");
             SHADER_UNIFORM(prog, r_nearplaneclip, "r_nearplaneclip");
+            SHADER_UNIFORM(prog, r_glow_color, "r_glow_color");
+            SHADER_UNIFORM(prog, r_csoenv_debug, "r_csoenv_debug");
         }
 
         g_StudioProgramTable[state] = prog;
@@ -1494,6 +1628,7 @@ const program_state_mapping_t s_StudioProgramStateName[] = {
     {STUDIO_NF_CELSHADE_HAIR, "STUDIO_NF_CELSHADE_HAIR"},
     {STUDIO_NF_DOUBLE_FACE, "STUDIO_NF_DOUBLE_FACE"},
     {STUDIO_NF_NOOUTLINE, "STUDIO_NF_NOOUTLINE"},
+    {STUDIO_NF_CSO_ENV, "STUDIO_NF_CSO_ENV"},
 };
 
 void R_SaveStudioProgramStates(void)
@@ -1531,6 +1666,18 @@ void R_InitStudio(void)
 {
     g_hStudioUBO = GL_GenBuffer();
     GL_UploadDataToUBODynamicDraw(g_hStudioUBO, sizeof(studio_ubo_t), nullptr);
+
+    //Without this, sampling a cubemap near a face edge can jump between two
+    //faces' independent border texels instead of blending across the seam.
+    //For the CSO env/parallax reflection that shows up as a visible pop
+    //between "dim" and "bright" as the weapon sways and the reflection
+    //vector crosses a cube edge - this fixes it globally, once.
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+
+    // 0 = normal, 1 = force the env layer to solid magenta (proves the tag/define/uniform
+    // chain works), 2 = paint the reflection vector as RGB (proves the vector actually
+    // sweeps as you turn - if this is frozen, the problem is normals/worldpos, not the cubemap)
+    r_csoenv_debug = gEngfuncs.pfnRegisterVariable("r_csoenv_debug", "0", FCVAR_CLIENTDLL);
 
     r_studio_celshade                 = gEngfuncs.pfnRegisterVariable("r_studio_celshade", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
     r_studio_celshade_midpoint        = gEngfuncs.pfnRegisterVariable("r_studio_celshade_midpoint", "-0.1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
@@ -1986,6 +2133,36 @@ void R_StudioSetupSkinEx(const CStudioModelRenderData* pRenderData, studiohdr_t*
 
     auto pStudioMaterial = R_StudioGetMaterialFromTexture(pRenderData, ptexture);
 
+    // TEMP DIAGNOSTIC (MH_Beamgun investigation): log, once per distinct
+    // state (not every frame - this runs per mesh per frame, so an
+    // unthrottled print would flood the console), exactly what this
+    // lookup sees for beamgun-related textures: whether a material was
+    // found at all, and if so, the override's gltexturenum/numframes at
+    // the moment this mesh is actually drawn. This is the ground truth
+    // SetStudioTextureOverride's own bool return value can't give a
+    // caller - it only reports whether the CALL was well-formed, not
+    // whether the override is actually present/being used here.
+    if (strstr(ptexture->name, "beamgun"))
+    {
+        static std::unordered_map<const mstudiotexture_t*, std::tuple<bool, int, int>> s_LastLogged;
+        bool                                                                           found     = (pStudioMaterial != nullptr);
+        int                                                                            loggedTex = 0, loggedFrames = 0;
+        if (found)
+        {
+            const auto& rt = pStudioMaterial->textures[STUDIO_DIFFUSE_TEXTURE];
+            loggedTex      = rt.gltexturenum;
+            loggedFrames   = (int)rt.numframes;
+        }
+        auto key = std::make_tuple(found, loggedTex, loggedFrames);
+        auto it  = s_LastLogged.find(ptexture);
+        if (it == s_LastLogged.end() || it->second != key)
+        {
+            s_LastLogged[ptexture] = key;
+            //gEngfuncs.Con_Printf("[DIAG] R_StudioSetupSkinEx: texture=\"%s\" material_found=%d gltexturenum=%d numframes=%d\n",
+            //	ptexture->name, (int)found, loggedTex, loggedFrames);
+        }
+    }
+
     if (pStudioMaterial)
     {
         R_StudioSetupMaterial(pRenderData, pStudioMaterial.get(), context);
@@ -2240,6 +2417,64 @@ void R_StudioDrawMesh_AnalysisPass(
     }
 }
 
+// ---------------------------------------------------------------------
+// CSO_ENV: static cubemap reflection on "@NNN" textures
+//
+// This is what CSO actually does. A "@NNN" tag in a studio texture name
+// (e.g. "$20@004_beamgunle_v01.bmp" -> 4) selects an *authored* static
+// cubemap; there is no scene capture anywhere in the process. The look is
+// reflect() against that cubemap, evaluated per fragment in
+// studio_shader.frag.glsl:
+//
+//     texCoordCube = reflect(worldpos - eye, normal);  texCoordCube.z *= -1.0;
+//     diffuse = (diffuse + addBright) * cubeColor * mulBright;
+//
+// Renderer owns the parts that live inside the studio draw path:
+//   - R_StudioAutoTagCsoEnvTextures() tags the textures at model load
+//   - the CSO_ENV shader variant, the cube texture on STUDIO_BIND_TEXTURE_ENVMAP
+//     and the r_glow_color uniform (see R_StudioDrawMesh_DrawPass())
+//
+// Everything about WHICH cubemap and how bright - shader/@NNN.txt,
+// shader/env.txt, the gfx/env/ faces, the GL cube textures and the
+// r_csoenv_mulbright / r_csoenv_addbright / r_csoenv_index cvars - belongs to
+// the plugin that registers an IMetaRendererStudioEnvProvider
+// (IMetaRendererStudioEnv.h; currently MH_Beamgun). With no provider, or when
+// the provider declines a texture, the CSO_ENV layer is simply not applied to
+// that mesh and it draws as a plain textured model.
+// ---------------------------------------------------------------------
+
+/*
+    Pulls the numeric id out of a CSO texture name - this is the "@NNN"
+    material tag number, e.g. "$20@004_beamgunle_v01.bmp" -> 4. It is used
+    both to tag the texture with STUDIO_NF_CSO_ENV and as the key the
+    registered IMetaRendererStudioEnvProvider resolves to a cubemap.
+*/
+int R_ParseCsoEnvIndexFromTextureName(const char* name)
+{
+    if (!name)
+        return -1;
+
+    const char* p = strchr(name, '@');
+
+    if (!p)
+        return -1;
+
+    ++p;
+
+    if (*p < '0' || *p > '9')
+        return -1;
+
+    int value = 0;
+
+    while (*p >= '0' && *p <= '9')
+    {
+        value = value * 10 + (*p - '0');
+        ++p;
+    }
+
+    return value;
+}
+
 void R_StudioDrawMesh_DrawPass(
     CStudioModelRenderData*     pRenderData,
     CStudioModelRenderSubModel* pRenderSubmodel,
@@ -2288,6 +2523,9 @@ void R_StudioDrawMesh_DrawPass(
     {
         StudioProgramState |= (STUDIO_ADDITIVE_BLEND_ENABLED | STUDIO_GLOW_SHELL_ENABLED | STUDIO_NF_CHROME);
 
+        //The glow shell is a flat additive shell, not the weapon's own surface
+        StudioProgramState &= ~STUDIO_NF_CSO_ENV;
+
         if (StudioProgramState & STUDIO_NF_CELSHADE_ALLBITS)
         {
             StudioProgramState &= ~STUDIO_NF_CELSHADE_ALLBITS;
@@ -2302,7 +2540,7 @@ void R_StudioDrawMesh_DrawPass(
         }
 
         StudioProgramState |= STUDIO_OUTLINE_ENABLED;
-        StudioProgramState &= ~(STUDIO_NF_CHROME | STUDIO_NF_ALPHA | STUDIO_NF_ADDITIVE | STUDIO_NF_CELSHADE_FACE | STUDIO_NF_CELSHADE_HAIR | STUDIO_NF_FULLBRIGHT);
+        StudioProgramState &= ~(STUDIO_NF_CHROME | STUDIO_NF_ALPHA | STUDIO_NF_ADDITIVE | STUDIO_NF_CELSHADE_FACE | STUDIO_NF_CELSHADE_HAIR | STUDIO_NF_FULLBRIGHT | STUDIO_NF_CSO_ENV);
     }
     else if ((*currententity)->curstate.renderfx == kRenderFxDrawAlphaMeshes)
     {
@@ -2780,9 +3018,67 @@ void R_StudioDrawMesh_DrawPass(
         }
     }
 
+    //CSO_ENV: which cubemap/brightness belongs to this texture is the
+    //registered provider's call (IMetaRendererStudioEnv.h). It has to be
+    //answered BEFORE the program is chosen: if nobody can supply a cubemap the
+    //CSO_ENV variant must not be compiled at all, because its envmapTex sampler
+    //would read an unbound cube map (black) and multiply the whole texture by it.
+    studio_env_result_t csoEnvResult = {0};
+
+    //The shadow caster pass is depth-only (studio_shader.frag.glsl), so it has no
+    //use for the env layer or for a provider call per mesh.
+    if (StudioProgramState & STUDIO_SHADOW_CASTER_ENABLED)
+        StudioProgramState &= ~STUDIO_NF_CSO_ENV;
+
+    if (StudioProgramState & STUDIO_NF_CSO_ENV)
+    {
+        bool bCsoEnvResolved = false;
+
+        if (g_pStudioEnvProvider)
+        {
+            //ptexture is the BASE of the model's texture table here - the texture
+            //this mesh actually uses is the one its skinref points at (same
+            //indexing as the Context.width/height lookup above).
+            const mstudiotexture_t* pCsoTexture = &ptexture[pskinref[pmesh->skinref]];
+
+            int tagIndex = R_ParseCsoEnvIndexFromTextureName(pCsoTexture->name);
+
+            if (tagIndex >= 0 && g_pStudioEnvProvider->ResolveStudioEnv(tagIndex, pCsoTexture->name, &csoEnvResult) && csoEnvResult.cubemap)
+                bCsoEnvResolved = true;
+        }
+        else
+        {
+            static bool s_bWarnedNoProvider = false;
+
+            if (!s_bWarnedNoProvider)
+            {
+                s_bWarnedNoProvider = true;
+                gEngfuncs.Con_Printf("[CSO_ENV] A texture is tagged \"@NNN\" but no IMetaRendererStudioEnv provider is registered (is MH_Beamgun loaded?) - the env layer is disabled.\n");
+            }
+        }
+
+        if (!bCsoEnvResolved)
+            StudioProgramState &= ~STUDIO_NF_CSO_ENV;
+    }
+
     studio_program_t prog = {0};
 
     R_UseStudioProgram(StudioProgramState, &prog);
+
+    if (StudioProgramState & STUDIO_NF_CSO_ENV)
+    {
+        GL_BindTextureUnit(STUDIO_BIND_TEXTURE_ENVMAP, GL_TEXTURE_CUBE_MAP, csoEnvResult.cubemap);
+
+        if (prog.r_glow_color != -1)
+        {
+            //Matches CSO's mdlrender: glowColor.w = addBright. mulBright rides in
+            //.xyz (CSO keeps it in colorMix.w, where it is commented out anyway).
+            glUniform4f(prog.r_glow_color, csoEnvResult.mulBright, csoEnvResult.mulBright, csoEnvResult.mulBright, csoEnvResult.addBright);
+        }
+
+        if (prog.r_csoenv_debug != -1)
+            glUniform1f(prog.r_csoenv_debug, r_csoenv_debug ? r_csoenv_debug->value : 0.0f);
+    }
 
     if (prog.r_base_specular != -1)
     {
@@ -3003,6 +3299,11 @@ void R_StudioDrawMesh_DrawPass(
     {
         //Texture unit 2 = Normal texture
         GL_BindTextureUnit(STUDIO_BIND_TEXTURE_NORMAL, GL_TEXTURE_2D, 0);
+    }
+
+    if (StudioProgramState & STUDIO_NF_CSO_ENV)
+    {
+        GL_BindTextureUnit(STUDIO_BIND_TEXTURE_ENVMAP, GL_TEXTURE_CUBE_MAP, 0);
     }
 
     GL_BindTextureUnit(STUDIO_BIND_TEXTURE_DIFFUSE, GL_TEXTURE_2D, 0);
@@ -4536,9 +4837,66 @@ void R_StudioLoadExternalFile_LowerBody(bspentity_t* ent, studiohdr_t* studiohdr
     REGISTER_LOWERBODY_KEY_VALUE(model_scale, UTIL_ParseStringAsVector1);
 }
 
+// Auto-tags any texture carrying a CSO "@NNN" material tag with
+// STUDIO_NF_CSO_ENV, so it gets the env-map layer with no _external.txt
+// needed. The tag number is what the IMetaRendererStudioEnv provider
+// resolves to a cubemap at draw time - see R_ParseCsoEnvIndexFromTextureName().
+void R_StudioAutoTagCsoEnvTextures(studiohdr_t* studiohdr)
+{
+    if (!studiohdr->textureindex || !studiohdr->numtextures)
+        return;
+
+    int taggedCount = 0;
+
+    for (int i = 0; i < studiohdr->numtextures; ++i)
+    {
+        auto ptexture = (mstudiotexture_t*)((byte*)studiohdr + studiohdr->textureindex) + i;
+
+        int tagIndex = R_ParseCsoEnvIndexFromTextureName(ptexture->name);
+
+        if (tagIndex >= 0)
+        {
+            ptexture->flags |= STUDIO_NF_CSO_ENV;
+            taggedCount++;
+
+            gEngfuncs.Con_Printf("[CSO_ENV] Tagged texture \"%s\" on model \"%s\" (tag %d).\n", ptexture->name, studiohdr->name, tagIndex);
+        }
+    }
+
+    if (taggedCount == 0)
+    {
+        gEngfuncs.Con_DPrintf("[CSO_ENV] No \"@NNN\" textures on model \"%s\" (numtextures=%d). Raw texture names:\n", studiohdr->name, studiohdr->numtextures);
+
+        // Dump every texture name exactly as compiled into the mdl, so a
+        // mismatch between what you named the .bmp and what actually made
+        // it into mstudiotexture_t::name (compiler lowercasing, truncation,
+        // a compiler that treats '@' as a reserved/stripped character,
+        // etc.) shows up immediately with `developer 1` set.
+        for (int i = 0; i < studiohdr->numtextures; ++i)
+        {
+            auto ptexture = (mstudiotexture_t*)((byte*)studiohdr + studiohdr->textureindex) + i;
+            gEngfuncs.Con_DPrintf("[CSO_ENV]   [%d] \"%s\" flags=0x%08X\n", i, ptexture->name, ptexture->flags);
+        }
+    }
+}
+
 void R_StudioLoadExternalFile(model_t* mod, studiohdr_t* studiohdr, CStudioModelRenderData* pRenderData)
 {
     gEngfuncs.Con_DPrintf("R_StudioLoadExternalFile: for \"%s\".\n", mod->name);
+
+    // Tag "@004" textures on whichever header actually holds the texture
+    // table. Most weapon models (this one included) keep their textures in
+    // an external T-model, in which case studiohdr->textureindex is 0 and
+    // tagging studiohdr directly is a no-op - R_StudioLoadTextureModel()
+    // above already resolved pRenderData->TextureModel by this point, so
+    // use that when present, exactly like the "$20" fullbright patch in
+    // R_GetStudioTextureHeader() does.
+    studiohdr_t* ptexturehdr = pRenderData->TextureModel
+                                   ? (studiohdr_t*)IEngineStudio.Mod_Extradata(pRenderData->TextureModel)
+                                   : studiohdr;
+
+    if (ptexturehdr)
+        R_StudioAutoTagCsoEnvTextures(ptexturehdr);
 
     std::string fullPath = mod->name;
 

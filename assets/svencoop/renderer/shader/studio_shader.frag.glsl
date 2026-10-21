@@ -10,6 +10,7 @@ layout(binding = STUDIO_BIND_TEXTURE_ANIMATED) uniform sampler2DArray animatedTe
 layout(binding = STUDIO_BIND_TEXTURE_STENCIL) uniform usampler2D stencilTex;
 layout(binding = STUDIO_BIND_TEXTURE_MIX_DIFFUSE) uniform sampler2D mixDiffuseTex;
 layout(binding = STUDIO_BIND_TEXTURE_DEPTH) uniform sampler2D depthTex;
+layout(binding = STUDIO_BIND_TEXTURE_ENVMAP) uniform samplerCube envmapTex;
 
 /* celshade */
 
@@ -41,6 +42,8 @@ uniform float r_packed_stride;
 uniform vec4 r_packed_index;
 uniform vec2 r_framerate_numframes;
 uniform vec2 r_nearplaneclip;
+uniform vec4 r_glow_color;
+uniform float r_csoenv_debug; // 0 = normal, 1 = solid magenta, 2 = reflection vector as color
 
 // Input from geometry shader (if enabled) or vertex shader (if not)
 #if defined(MULTIVIEW_ENABLED)
@@ -879,6 +882,54 @@ void main(void)
 
 	vec3 vNormal = R_GenerateAdjustedNormal(vWorldPos, flNormalAdjustment);
 
+	#if defined(CSO_ENV)
+
+		// CSO-style env map. Ported 1:1 from from_lstrike-common/mdlrender.vs:
+		//
+		//     texCoordCube = reflect(transpos.xyz - worldEye.xyz, normal);
+		//     texCoordCube.z *= -1.0;
+		//
+		// and mdlrender.fs:
+		//
+		//     vDiffuse.xyz = (vDiffuse.xyz + glowColor.www) * cubeColor;
+		//
+		// Two things matter here and both were wrong before:
+		//
+		//  1. The z flip. GoldSrc world space is Z-up; the cubemap basis is
+		//     Y-up. Without this the faces are mapped onto the wrong axes and
+		//     the reflection sweeps the wrong way as you turn.
+		//
+		//  2. The combine is a MULTIPLY, not an add, and it lands on
+		//     diffuseColor *before* the lightmap multiply - not on finalColor
+		//     after fog. An additive env layer over a black cubemap is
+		//     invisible; a multiplicative one turns the mesh black, which is a
+		//     failure you can actually see.
+		//
+		// r_glow_color.xyz = mulBright, r_glow_color.w = addBright.
+
+		vec3 vCsoEnvIncident = vWorldPos - GetCameraViewPos(0);
+		vec3 vCsoEnvDir = reflect(vCsoEnvIncident, vNormal);
+		vCsoEnvDir.z *= -1.0;
+
+		if (r_csoenv_debug > 1.5)
+		{
+			// Should be a smooth gradient that sweeps as you rotate the view.
+			// If it is frozen, the bug is in vWorldPos / vNormal, not the cubemap.
+			diffuseColor.rgb = normalize(vCsoEnvDir) * 0.5 + 0.5;
+		}
+		else if (r_csoenv_debug > 0.5)
+		{
+			diffuseColor.rgb = vec3(1.0, 0.0, 1.0);
+		}
+		else
+		{
+			vec3 vCsoEnvColor = texture(envmapTex, vCsoEnvDir).rgb;
+
+			diffuseColor.rgb = (diffuseColor.rgb + r_glow_color.www) * vCsoEnvColor * r_glow_color.xyz;
+		}
+
+	#endif
+
 	#if defined(ADDITIVE_RENDER_MODE_ENABLED) || defined(GLOW_SHELL_ENABLED)
 
 		vec4 lightmapColor = ProcessOtherGammaColor(StudioUBO.r_color);
@@ -929,6 +980,8 @@ void main(void)
 
 		vec2 vOctNormal = UnitVectorToOctahedron(vNormal);
 
+		//CSO_ENV is already folded into diffuseColor above, so the deferred
+		//path picks it up for free and stays consistent with the forward one.
 		out_Diffuse = diffuseColor;
 		out_Lightmap = lightmapColor;
 		out_WorldNorm = vec4(vOctNormal.x, vOctNormal.y, flDistanceToFragment, 0.0);

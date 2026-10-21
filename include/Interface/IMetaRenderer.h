@@ -13,6 +13,8 @@ typedef struct camera_view_s        camera_view_t;
 typedef struct camera_ubo_s         camera_ubo_t;
 // "cl_entity.h"
 typedef struct cl_entity_s cl_entity_t;
+// "com_model.h"
+typedef struct model_s model_t;
 
 class CCompileShaderArgs;
 
@@ -73,6 +75,42 @@ public:
         Called from R_RenderEndFrame
     */
     virtual void OnRenderEndFrame() = 0;
+};
+
+/*
+    ABI NOTE - why this is its own interface instead of one more method on
+    IMetaRendererCallbacks above:
+
+    IMetaRendererCallbacks is IMPLEMENTED BY PLUGINS, so its vtable shape is
+    part of the ABI between Renderer.dll and every already-compiled plugin
+    binary out there. Appending a method to it does NOT just "add a slot at
+    the end" for those binaries - their vtables were emitted with the old
+    method count, so Renderer calling the new slot reads whatever happens to
+    sit after the vtable in .rdata and jumps to it. That is an immediate
+    crash the first time the new callback fires.
+
+    (IMetaRenderer below is the opposite case: only Renderer implements it,
+    plugins only ever call through it, so appending methods THERE is safe -
+    an old plugin simply never calls the new slots.)
+
+    So a plugin that wants the viewmodel-pass callback implements this
+    separate interface and registers it through
+    IMetaRenderer::RegisterViewModelCallbacks(). Plugins that don't know
+    about it are never called back and keep working unchanged.
+*/
+class IMetaRendererViewModelCallbacks : public IBaseInterface
+{
+public:
+    /*
+        Called from R_DrawViewModel, right after the weapon studiomodel/
+        brush has been rendered, while depth is still fully cleared and the
+        viewmodel's own narrow FOV projection + camera UBO are still bound.
+        Draw weapon-attached cosmetics (TriAPI sprites etc.) here, NOT from
+        HUD_DrawTransparentTriangles -- that pass runs before the depth clear
+        and uses the wrong projection, which is why cosmetics end up
+        occluded by the gun.
+    */
+    virtual void OnDrawViewModel() = 0;
 };
 
 class IMetaRenderer : public IBaseInterface
@@ -722,6 +760,89 @@ public:
         return s_BackBufferFBO5, which is RGBA8 D24S8, W x H = SwapChainWidth x SwapChainHeight
     */
     virtual FBO_Container_t* GetBackBufferFBO5() const = 0;
+
+    /*
+        Purpose: Runtime counterpart to the map-entity "replacetexture" keyvalue -
+        overrides the diffuse texture drawn for ONE texture slot of a studio
+        model, identified by "texIndex" (the RAW index into the model's own
+        texture table, i.e. what a model viewer's texture list shows - NOT a
+        skin index). Unlike the entity-keyvalue path, this can be called at
+        any time (e.g. once per frame from a view-model animation callback),
+        and different texIndex values on the same model each hold their own
+        independent override - so a plugin is no longer limited to replacing
+        a single texture per model.
+
+        If numframes > 1, gltexturenum MUST be a GL_TEXTURE_2D_ARRAY with
+        that many layers; Renderer then animates through them on its own at
+        "framerate" (same as an animated replacetexture). Pass numframes = 0
+        for a plain single GL_TEXTURE_2D.
+
+        scaleX/scaleY are UV tiling scale for this slot - pass 1.0f/1.0f to
+        leave the model's own scale untouched.
+
+        Pass gltexturenum = 0 to clear a previously-set override for this
+        (mod, texIndex) pair and revert to the model's own baked texture.
+
+        Returns false if mod is null, has no texture table, or texIndex is
+        out of range for it.
+
+        NOTE: added after API_002 was frozen - only present on a Renderer.dll
+        build compiled with this same header. Does not exist on legacy
+        (API_005) builds at all; callers must not invoke this through an
+        IMetaRenderer_v005*-typed pointer (see g_bLegacyRendererAPI in
+        RendererImport.h).
+    */
+    virtual bool SetStudioTextureOverride(model_t* mod, int texIndex, int gltexturenum, int numframes, float framerate, float scaleX, float scaleY) = 0;
+
+    /*
+        Purpose: Returns the 4 studio attachment points of the local player's
+        viewmodel entity (cl_viewent), exactly as they were computed by the
+        engine's own studio attachment calc for the frame currently being
+        drawn - i.e. the SAME values StudioDrawModel(STUDIO_RENDER) just
+        wrote into currententity->attachment[0..3] inside R_DrawViewModel(),
+        snapshotted right after that call.
+
+        Layout: 4 consecutive vec3_t (12 floats total), attachment index i
+        at offset [i*3 .. i*3+2]. Which index is "the muzzle" depends on
+        how the .mdl's attachments were authored - check with a model
+        viewer if unsure; index 0 is the conventional default.
+
+        Only meaningful when called from inside
+        IMetaRendererCallbacks::OnDrawViewModel() - that's the one point in
+        the frame where these values are valid AND the depth buffer/
+        projection they were computed against are still bound, so TriAPI
+        geometry built from them lands in the same "cheated" close-up space
+        the viewmodel mesh itself was just drawn in. Calling this at any
+        other time returns stale data from whatever frame last drew a
+        viewmodel (or a zeroed array if none has yet).
+
+        Returns nullptr if there is no current viewmodel entity this frame.
+
+        NOTE: added after API_002 was frozen - same caveat as
+        SetStudioTextureOverride above: only present on a Renderer.dll
+        build compiled with this same header, not on legacy (API_005)
+        builds. Gate calls through g_bLegacyRendererAPI (see
+        RendererImport.h) rather than calling this directly on a
+        IMetaRenderer_v005*-typed pointer.
+    */
+    virtual const float* GetTrustedViewModelAttachments() const = 0;
+
+    /*
+        Purpose: register/unregister an IMetaRendererViewModelCallbacks
+        implementation (see that class above for why it is separate from
+        IMetaRendererCallbacks). Registered objects get OnDrawViewModel()
+        called once per frame from inside R_DrawViewModel(), in
+        registration order. Unregister before your DLL unloads.
+
+        Safe to append here: plugins never implement IMetaRenderer, they
+        only call through it, so an older plugin built against a header
+        without these simply never calls them.
+
+        NOTE: added after API_002 was frozen - same caveat as
+        SetStudioTextureOverride / GetTrustedViewModelAttachments above.
+    */
+    virtual void RegisterViewModelCallbacks(IMetaRendererViewModelCallbacks* ViewModelCallbacks)   = 0;
+    virtual void UnregisterViewModelCallbacks(IMetaRendererViewModelCallbacks* ViewModelCallbacks) = 0;
 };
 
 IMetaRenderer* MetaRenderer();

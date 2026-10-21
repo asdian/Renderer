@@ -158,6 +158,7 @@ public:
 #    define STUDIO_BIND_TEXTURE_STENCIL     6
 #    define STUDIO_BIND_TEXTURE_MIX_DIFFUSE 7
 #    define STUDIO_BIND_TEXTURE_DEPTH       8
+#    define STUDIO_BIND_TEXTURE_ENVMAP      1
 
 #    define STENCIL_MASK_ALL  0xFF
 #    define STENCIL_MASK_NONE 0

@@ -303,6 +303,13 @@ std::set<mbasenode_t*>    g_VisibleBSPNodes;
 
 std::vector<IMetaRendererCallbacks*> g_RenderCallbacks;
 
+// Kept deliberately SEPARATE from g_RenderCallbacks above: only plugins
+// compiled against a header that actually declares
+// IMetaRendererViewModelCallbacks can end up in here, so iterating it can
+// never call a vtable slot an older plugin binary doesn't have. See the
+// ABI NOTE on IMetaRendererViewModelCallbacks in IMetaRenderer.h.
+std::vector<IMetaRendererViewModelCallbacks*> g_ViewModelCallbacks;
+
 int glx      = 0;
 int gly      = 0;
 int glwidth  = 0;
@@ -1476,7 +1483,7 @@ void R_AddTEntity(cl_entity_t* ent)
 }
 
 entity_state_t* R_GetPlayerState(int playerIndex)
-{
+    {
     if (playerIndex < 0 || playerIndex >= MAX_CLIENTS || playerIndex >= gEngfuncs.GetMaxClients())
         return nullptr;
 
@@ -1485,10 +1492,37 @@ entity_state_t* R_GetPlayerState(int playerIndex)
 
 void R_DrawSpriteEntity(bool bTransparent)
 {
-    if ((*currententity)->curstate.body)
+    // R_IsViewmodelAttachment entities (env_sprite muzzleflashes etc. with
+    // EF_VIEWMODEL) already have their exact attachment-point origin
+    // written into (*currententity)->origin by the
+    // g_ViewModelAttachmentEntities loop in R_DrawViewModel, using
+    // g_TrustedViewModelAttachments[curstate.body] - THIS frame's actual
+    // viewmodel attachment snapshot, 0-based.
+    //
+    // The general lookup below is a DIFFERENT, pre-existing convention:
+    // curstate.body is 1-based there (attachment index + 1, 0 = "use
+    // ent->origin"), resolved via
+    // GetEntityByIndex(curstate.skin)->attachment[body - 1] - i.e. it
+    // reads the attachment array of WHATEVER ENTITY curstate.skin names.
+    // A server-spawned env_sprite that never sets skin defaults to 0
+    // (the world entity), so for any nonzero body this was silently
+    // substituting the world entity's (meaningless) attachment data in
+    // place of the correct origin computed above - which is exactly what
+    // was happening here, since AMX Mod X's muzzleflash events all use
+    // attachment index 1 (var_body = 1, nonzero) and never set var_skin.
+    // Skip this lookup entirely for viewmodel-attached entities; their
+    // origin is already correct.
+    if (!R_IsViewmodelAttachment((*currententity)))
     {
-        float* pAttachment = R_GetAttachmentPoint((*currententity)->curstate.skin, (*currententity)->curstate.body);
-        VectorCopy(pAttachment, r_entorigin);
+        if ((*currententity)->curstate.body)
+        {
+            float* pAttachment = R_GetAttachmentPoint((*currententity)->curstate.skin, (*currententity)->curstate.body);
+            VectorCopy(pAttachment, r_entorigin);
+        }
+        else
+        {
+            VectorCopy((*currententity)->origin, r_entorigin);
+        }
     }
     else
     {
@@ -2658,11 +2692,53 @@ void R_DrawViewModel(void)
             }
         }
 
+        // Snapshot the freshly-computed attachment points before anything
+        // else touches currententity->attachment[] this frame (see
+        // GetTrustedViewModelAttachments()) - has to happen before the
+        // OnDrawViewModel callback loop below, since that's the whole
+        // point: plugins reading g_TrustedViewModelAttachments from inside
+        // that callback need this frame's values, not last frame's.
+        for (int i = 0; i < 4; i++)
+        {
+            VectorCopy((*currententity)->attachment[i], g_TrustedViewModelAttachments[i]);
+        }
+
+        // NOTE: g_ViewModelCallbacks, NOT g_RenderCallbacks - see the
+        // declaration of g_ViewModelCallbacks and the ABI NOTE in
+        // IMetaRenderer.h. Iterating an index copy rather than the
+        // container itself so a callback that unregisters itself mid-draw
+        // can't invalidate the iterator.
+        for (size_t i = 0; i < g_ViewModelCallbacks.size(); ++i)
+        {
+            g_ViewModelCallbacks[i]->OnDrawViewModel();
+        }
+
         for (size_t i = 0; i < g_ViewModelAttachmentEntities.size(); ++i)
         {
             (*currententity) = g_ViewModelAttachmentEntities[i];
 
-            VectorCopy(cl_viewent->origin, (*currententity)->origin);
+            // curstate.body doubles as the attachment index for a
+            // MOVETYPE_FOLLOW entity attached to the viewmodel (the same
+            // convention AMX Mod X's env_sprite muzzleflashes use - see
+            // var_body in FireMuzzleflashesForSequence). g_TrustedViewModelAttachments[]
+            // was just snapshotted above from THIS frame's actual viewmodel
+            // attachment array, so use it here instead of always collapsing
+            // every attached entity onto cl_viewent->origin - that origin is
+            // the gun's single base point, not any specific attachment, and
+            // for a muzzle-tip attachment that point sits behind/inside the
+            // visible gun mesh from the camera - which is why a sprite could
+            // correctly reach this pass and still look "behind the weapon".
+            // Fall back to cl_viewent->origin for an out-of-range body (e.g.
+            // unset/-1), same as the previous unconditional behavior.
+            int attachIndex = (*currententity)->curstate.body;
+            if (attachIndex >= 0 && attachIndex < 4)
+            {
+                VectorCopy(g_TrustedViewModelAttachments[attachIndex], (*currententity)->origin);
+            }
+            else
+            {
+                VectorCopy(cl_viewent->origin, (*currententity)->origin);
+            }
             VectorCopy(cl_viewent->angles, (*currententity)->angles);
 
             if ((*currententity)->curstate.rendermode == kRenderNormal)
@@ -3091,6 +3167,10 @@ void R_Init(void)
 void R_Shutdown(void)
 {
     g_RenderCallbacks.clear();
+    g_ViewModelCallbacks.clear();
+
+    //Never leave a pointer into a plugin DLL behind
+    g_pStudioEnvProvider = nullptr;
 
     R_ShutdownWater();
     R_ShutdownStudio();
@@ -3808,6 +3888,23 @@ void R_DrawEntitiesOnList(void)
     {
         (*currententity) = cl_visedicts[i];
 
+        // Checked BEFORE the rendermode-based routing below: a MOVETYPE_FOLLOW
+        // entity flagged EF_VIEWMODEL (e.g. AMX Mod X's own muzzleflash
+        // env_sprites) needs to reach R_AddViewModelAttachmentEntity() even
+        // when it's kRenderTransAdd/kRenderGlow/etc, which is the overwhelmingly
+        // common case for this kind of cosmetic. Previously any non-kRenderNormal
+        // entity was unconditionally routed into R_AddTEntity() first and this
+        // check was never reached, so an EF_VIEWMODEL entity with a transparent
+        // rendermode silently drew in the ordinary world transparent pass and
+        // got occluded the moment R_DrawViewModel cleared depth and redrew the
+        // gun on top of it - same visual bug as an unflagged entity, just from
+        // a different cause.
+        if (R_IsViewmodelAttachment((*currententity)))
+        {
+            R_AddViewModelAttachmentEntity((*currententity));
+            continue;
+        }
+
         if ((*currententity)->curstate.rendermode != kRenderNormal)
         {
             R_AddTEntity((*currententity));
@@ -3820,12 +3917,6 @@ void R_DrawEntitiesOnList(void)
             gl_spriteblend->value)
         {
             R_AddTEntity((*currententity));
-            continue;
-        }
-
-        if (R_IsViewmodelAttachment((*currententity)))
-        {
-            R_AddViewModelAttachmentEntity((*currententity));
             continue;
         }
 
@@ -6704,6 +6795,26 @@ public:
         }
     }
 
+    void RegisterViewModelCallbacks(IMetaRendererViewModelCallbacks* ViewModelCallbacks) override
+    {
+        if (!ViewModelCallbacks)
+            return;
+
+        if (std::find(g_ViewModelCallbacks.begin(), g_ViewModelCallbacks.end(), ViewModelCallbacks) != g_ViewModelCallbacks.end())
+            return; // already registered - don't double-call it every frame
+
+        g_ViewModelCallbacks.emplace_back(ViewModelCallbacks);
+    }
+
+    void UnregisterViewModelCallbacks(IMetaRendererViewModelCallbacks* ViewModelCallbacks) override
+    {
+        auto it = std::find(g_ViewModelCallbacks.begin(), g_ViewModelCallbacks.end(), ViewModelCallbacks);
+        if (it != g_ViewModelCallbacks.end())
+        {
+            g_ViewModelCallbacks.erase(it);
+        }
+    }
+
     void SetDrawClassify(int drawClassify) override
     {
         r_draw_classify = drawClassify;
@@ -6748,6 +6859,40 @@ public:
     {
         return &s_BackBufferFBO5;
     }
+
+    bool SetStudioTextureOverride(model_t* mod, int texIndex, int gltexturenum, int numframes, float framerate, float scaleX, float scaleY) override
+    {
+        return R_StudioSetTextureOverride(mod, texIndex, gltexturenum, numframes, framerate, scaleX, scaleY);
+    }
+
+    const float* GetTrustedViewModelAttachments() const override
+    {
+        if (!cl_viewent)
+            return nullptr;
+
+        return &g_TrustedViewModelAttachments[0][0];
+    }
 };
 
 EXPOSE_SINGLE_INTERFACE(CMetaRenderer, IMetaRenderer, METARENDERER_INTERFACE_VERSION);
+
+/*
+    CSO_ENV provider registration. Kept as its own interface with its own
+    version string on purpose - see the ABI NOTE in IMetaRendererStudioEnv.h.
+*/
+class CMetaRendererStudioEnv : public IMetaRendererStudioEnv
+{
+public:
+    void RegisterProvider(IMetaRendererStudioEnvProvider* pProvider) override
+    {
+        g_pStudioEnvProvider = pProvider;
+    }
+
+    void UnregisterProvider(IMetaRendererStudioEnvProvider* pProvider) override
+    {
+        if (g_pStudioEnvProvider == pProvider)
+            g_pStudioEnvProvider = nullptr;
+    }
+};
+
+EXPOSE_SINGLE_INTERFACE(CMetaRendererStudioEnv, IMetaRendererStudioEnv, METARENDERER_STUDIOENV_VERSION);
