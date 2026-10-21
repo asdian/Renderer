@@ -21,6 +21,7 @@
 #include <IVideoMode.h>
 
 #include <IMetaRenderer.h>
+#include <IMetaRendererStudioEnv.h>
 
 #include <set>
 #include <map>
@@ -635,6 +636,7 @@ bool SaveImageGenericRGBA8(const char* filename, const char* pathId, int width, 
 
 cubemap_t* R_FindCubemap(float* origin);
 void       R_LoadCubemap(cubemap_t* cubemap);
+int        R_ParseCsoEnvIndexFromTextureName(const char* name);
 void       R_BuildCubemaps_f(void);
 
 void R_SaveProgramStates_f(void);

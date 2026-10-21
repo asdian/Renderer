@@ -223,11 +223,22 @@ typedef struct alight_s
 #define STUDIO_NF_MASKED     0x0040
 
 // renderer-private options
-#define STUDIO_NF_CELSHADE           0x1000
-#define STUDIO_NF_CELSHADE_FACE      0x2000
-#define STUDIO_NF_CELSHADE_HAIR      0x4000
-#define STUDIO_NF_DOUBLE_FACE        0x10000
-#define STUDIO_NF_NOOUTLINE          0x40000
+#define STUDIO_NF_CELSHADE      0x1000
+#define STUDIO_NF_CELSHADE_FACE 0x2000
+#define STUDIO_NF_CELSHADE_HAIR 0x4000
+#define STUDIO_NF_DOUBLE_FACE   0x10000
+#define STUDIO_NF_NOOUTLINE     0x40000
+//0x0080 is STUDIO_NF_UV_COORDS in the HL25 studio header, and these flags are
+//written back into the real mstudiotexture_t::flags - keep CSO_ENV on a bit the
+//engine never looks at.
+//
+//These bits are ALSO the low bits of program_state_t (see gl_common.h), where
+//every bit from 0x80000 up is a STUDIO_*_ENABLED state. CSO_ENV used to be
+//0x80000 with ALLOWBITS widened to 0xFFFFF, which is STUDIO_GBUFFER_ENABLED:
+//a CSO_ENV texture compiled a GBUFFER_ENABLED shader in the forward pass, and
+//every mesh drawn into the gbuffer compiled CSO_ENV. 0x20000 is unused by
+//both sides and is inside the original 0x7FFFF mask.
+#define STUDIO_NF_CSO_ENV            0x20000 // auto-tagged env-map layer for "@NNN"-named CSO textures
 #define STUDIO_NF_RENDERER_ALLOWBITS 0x7FFFF
 
 #define STUDIO_NF_FULLBRIGHT_ALLOWBITS   (STUDIO_NF_RENDERER_ALLOWBITS & ~(STUDIO_NF_FLATSHADE))

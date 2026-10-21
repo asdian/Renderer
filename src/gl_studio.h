@@ -51,6 +51,8 @@ typedef struct studio_program_s
     int r_packed_index{-1};
     int r_framerate_numframes{-1};
     int r_nearplaneclip{-1};
+    int r_glow_color{-1};
+    int r_csoenv_debug{-1}; // 0 = normal, 1 = solid magenta, 2 = reflection vector as color - see gl_studio.cpp/studio_shader.frag.glsl
 } studio_program_t;
 
 class studiovertexbase_t
@@ -326,6 +328,8 @@ extern float (*pbonetransform)[MAXSTUDIOBONES][3][4];
 extern float (*plighttransform)[MAXSTUDIOBONES][3][4];
 extern float (*rotationmatrix)[3][4];
 extern cl_entity_t* cl_viewent;
+extern IMetaRendererStudioEnvProvider* g_pStudioEnvProvider;
+bool R_StudioSetTextureOverride(model_t* mod, int texIndex, int gltexturenum, int numframes, float framerate, float scaleX, float scaleY);
 extern int*         g_ForcedFaceFlags;
 extern int*         lightgammatable;
 extern byte*        texgammatable;
